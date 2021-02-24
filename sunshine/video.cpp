@@ -291,7 +291,7 @@ static encoder_t software {
   { FF_PROFILE_H264_HIGH, FF_PROFILE_HEVC_MAIN, FF_PROFILE_HEVC_MAIN_10 },
   AV_HWDEVICE_TYPE_NONE,
   AV_PIX_FMT_NONE,
-  AV_PIX_FMT_YUV420P, AV_PIX_FMT_YUV420P10,
+  AV_PIX_FMT_YUV420P, AV_PIX_FMT_YUV420P,
   {
     // x265's Info SEI is so long that it causes the IDR picture data to be
     // kicked to the 2nd packet in the frame, breaking Moonlight's parsing logic.
