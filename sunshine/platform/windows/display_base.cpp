@@ -90,16 +90,10 @@ int display_base_t::init() {
     FreeLibrary(user32);
   });
 */
-  dxgi::factory1_t::pointer   factory_p {};
-  dxgi::adapter_t::pointer    adapter_p {};
-  dxgi::output_t::pointer     output_p {};
-  dxgi::device_t::pointer     device_p {};
-  dxgi::device_ctx_t::pointer device_ctx_p {};
 
   HRESULT status;
 
-  status = CreateDXGIFactory1(IID_IDXGIFactory1, (void**)&factory_p);
-  factory.reset(factory_p);
+  status = CreateDXGIFactory1(IID_IDXGIFactory1, (void**)&factory);
   if(FAILED(status)) {
     BOOST_LOG(error) << "Failed to create DXGIFactory1 [0x"sv << util::hex(status).to_string_view() << ']';
     return -1;
@@ -110,7 +104,8 @@ int display_base_t::init() {
   auto adapter_name = converter.from_bytes(config::video.adapter_name);
   auto output_name = converter.from_bytes(config::video.output_name);
 
-  for(int x = 0; factory_p->EnumAdapters1(x, &adapter_p) != DXGI_ERROR_NOT_FOUND; ++x) {
+  adapter_t::pointer adapter_p;
+  for(int x = 0; factory->EnumAdapters1(x, &adapter_p) != DXGI_ERROR_NOT_FOUND; ++x) {
     dxgi::adapter_t adapter_tmp { adapter_p };
 
     DXGI_ADAPTER_DESC1 adapter_desc;
@@ -120,8 +115,9 @@ int display_base_t::init() {
       continue;
     }
 
+    dxgi::output_t::pointer output_p;
     for(int y = 0; adapter_tmp->EnumOutputs(y, &output_p) != DXGI_ERROR_NOT_FOUND; ++y) {
-      dxgi::output_t output_tmp {output_p };
+      dxgi::output_t output_tmp { output_p };
 
       DXGI_OUTPUT_DESC desc;
       output_tmp->GetDesc(&desc);
@@ -133,8 +129,10 @@ int display_base_t::init() {
       if(desc.AttachedToDesktop) {
         output = std::move(output_tmp);
 
-        width  = desc.DesktopCoordinates.right - desc.DesktopCoordinates.left;
-        height = desc.DesktopCoordinates.bottom - desc.DesktopCoordinates.top;
+        offset_x = desc.DesktopCoordinates.left;
+        offset_y = desc.DesktopCoordinates.top;
+        width  = desc.DesktopCoordinates.right - offset_x;
+        height = desc.DesktopCoordinates.bottom - offset_y;
       }
     }
 
@@ -150,8 +148,6 @@ int display_base_t::init() {
   }
 
   D3D_FEATURE_LEVEL featureLevels[] {
-    D3D_FEATURE_LEVEL_12_1,
-    D3D_FEATURE_LEVEL_12_0,
     D3D_FEATURE_LEVEL_11_1,
     D3D_FEATURE_LEVEL_11_0,
     D3D_FEATURE_LEVEL_10_1,
@@ -164,7 +160,6 @@ int display_base_t::init() {
   status = adapter->QueryInterface(IID_IDXGIAdapter, (void**)&adapter_p);
   if(FAILED(status)) {
     BOOST_LOG(error) << "Failed to query IDXGIAdapter interface"sv;
-
     return -1;
   }
 
@@ -175,14 +170,12 @@ int display_base_t::init() {
     D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
     featureLevels, sizeof(featureLevels) / sizeof(D3D_FEATURE_LEVEL),
     D3D11_SDK_VERSION,
-    &device_p,
+    &device,
     &feature_level,
-    &device_ctx_p);
+    &device_ctx);
 
   adapter_p->Release();
 
-  device.reset(device_p);
-  device_ctx.reset(device_ctx_p);
   if(FAILED(status)) {
     BOOST_LOG(error) << "Failed to create D3D11 device [0x"sv << util::hex(status).to_string_view() << ']';
 
@@ -206,12 +199,40 @@ int display_base_t::init() {
 
   // Bump up thread priority
   {
-    dxgi::dxgi_t::pointer dxgi_p {};
-    status = device->QueryInterface(IID_IDXGIDevice, (void**)&dxgi_p);
-    dxgi::dxgi_t dxgi { dxgi_p };
+    const DWORD flags = TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY;
+    TOKEN_PRIVILEGES tp;
+    HANDLE token;
+    LUID val;
 
+    if (OpenProcessToken(GetCurrentProcess(), flags, &token) &&
+       !!LookupPrivilegeValue(NULL, SE_INC_BASE_PRIORITY_NAME, &val)) {
+      tp.PrivilegeCount = 1;
+      tp.Privileges[0].Luid = val;
+      tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+
+      if (!AdjustTokenPrivileges(token, false, &tp, sizeof(tp), NULL, NULL)) {
+        BOOST_LOG(warning) << "Could not set privilege to increase GPU priority";
+      }
+    }
+
+    CloseHandle(token);
+
+    HMODULE gdi32 = GetModuleHandleA("GDI32");
+    if (gdi32) {
+      PD3DKMTSetProcessSchedulingPriorityClass fn =
+        (PD3DKMTSetProcessSchedulingPriorityClass)GetProcAddress(gdi32, "D3DKMTSetProcessSchedulingPriorityClass");
+      if (fn) {
+        status = fn(GetCurrentProcess(), D3DKMT_SCHEDULINGPRIORITYCLASS_REALTIME);
+        if (FAILED(status)) {
+          BOOST_LOG(warning) << "Failed to set realtime GPU priority. Please run application as administrator for optimal performance.";
+        }
+      }
+    }
+
+    dxgi::dxgi_t dxgi;
+    status = device->QueryInterface(IID_IDXGIDevice, (void**)&dxgi);
     if(FAILED(status)) {
-      BOOST_LOG(error) << "Failed to query DXGI interface from device [0x"sv << util::hex(status).to_string_view() << ']';
+      BOOST_LOG(warning) << "Failed to query DXGI interface from device [0x"sv << util::hex(status).to_string_view() << ']';
       return -1;
     }
 
@@ -220,25 +241,24 @@ int display_base_t::init() {
 
   // Try to reduce latency
   {
-    dxgi::dxgi1_t::pointer dxgi_p {};
-    status = device->QueryInterface(IID_IDXGIDevice, (void**)&dxgi_p);
-    dxgi::dxgi1_t dxgi { dxgi_p };
-
+    dxgi::dxgi1_t dxgi {};
+    status = device->QueryInterface(IID_IDXGIDevice, (void**)&dxgi);
     if(FAILED(status)) {
       BOOST_LOG(error) << "Failed to query DXGI interface from device [0x"sv << util::hex(status).to_string_view() << ']';
       return -1;
     }
 
-    dxgi->SetMaximumFrameLatency(1);
+    status = dxgi->SetMaximumFrameLatency(1);
+    if(FAILED(status)) {
+      BOOST_LOG(warning) << "Failed to set maximum frame latency [0x"sv << util::hex(status).to_string_view() << ']';
+    }
   }
 
   //FIXME: Duplicate output on RX580 in combination with DOOM (2016) --> BSOD
   //TODO: Use IDXGIOutput5 for improved performance
   {
-    dxgi::output1_t::pointer output1_p {};
-    status = output->QueryInterface(IID_IDXGIOutput1, (void**)&output1_p);
-    dxgi::output1_t output1 {output1_p };
-
+    dxgi::output1_t output1 {};
+    status = output->QueryInterface(IID_IDXGIOutput1, (void**)&output1);
     if(FAILED(status)) {
       BOOST_LOG(error) << "Failed to query IDXGIOutput1 from the output"sv;
       return -1;
@@ -246,10 +266,8 @@ int display_base_t::init() {
 
     // We try this twice, in case we still get an error on reinitialization
     for(int x = 0; x < 2; ++x) {
-      dxgi::dup_t::pointer dup_p {};
-      status = output1->DuplicateOutput((IUnknown*)device.get(), &dup_p);
+      status = output1->DuplicateOutput((IUnknown*)device.get(), &dup.dup);
       if(SUCCEEDED(status)) {
-        dup.reset(dup_p);
         break;
       }
       std::this_thread::sleep_for(200ms);

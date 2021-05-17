@@ -43,6 +43,33 @@ enum class pix_fmt_e {
   unknown
 };
 
+inline std::string_view from_pix_fmt(pix_fmt_e pix_fmt) {
+using namespace std::literals;
+#define _CONVERT(x) case pix_fmt_e:: x : return  #x ## sv
+  switch(pix_fmt) {
+    _CONVERT(yuv420p);
+    _CONVERT(yuv420p10);
+    _CONVERT(nv12);
+    _CONVERT(p010);
+    _CONVERT(unknown);
+  }
+#undef _CONVERT
+
+  return "unknown"sv;
+}
+
+// Dimensions for touchscreen input
+struct touch_port_t {
+  std::uint32_t offset_x, offset_y;
+  std::uint32_t width, height;
+
+  constexpr touch_port_t(
+    std::uint32_t offset_x, std::uint32_t offset_y,
+    std::uint32_t width, std::uint32_t height) noexcept :
+    offset_x { offset_x }, offset_y { offset_y },
+    width { width }, height { height } {};
+};
+
 struct gamepad_state_t {
   std::uint16_t buttonFlags;
   std::uint8_t lt;
@@ -95,6 +122,7 @@ enum class capture_e : int {
 
 class display_t {
 public:
+  display_t() noexcept : offset_x { 0 }, offset_y { 0 } {}
   virtual capture_e snapshot(img_t *img, std::chrono::milliseconds timeout, bool cursor) = 0;
   virtual std::shared_ptr<img_t> alloc_img() = 0;
 
@@ -105,6 +133,9 @@ public:
   }
 
   virtual ~display_t() = default;
+
+  // Offsets for when streaming a specific monitor. By default, they are 0.
+  int offset_x, offset_y;
 
   int width, height;
 };
@@ -131,6 +162,7 @@ std::shared_ptr<display_t> display(dev_type_e hwdevice_type);
 
 input_t input();
 void move_mouse(input_t &input, int deltaX, int deltaY);
+void abs_mouse(input_t &input, const touch_port_t &touch_port, float x, float y);
 void button_mouse(input_t &input, int button, bool release);
 void scroll(input_t &input, int distance);
 void keyboard(input_t &input, uint16_t modcode, bool release);

@@ -2,6 +2,8 @@
 // Created by loki on 6/20/19.
 //
 
+// define uint32_t for <moonlight-common-c/src/Input.h>
+#include <cstdint>
 extern "C" {
 #include <moonlight-common-c/src/Input.h>
 }
@@ -11,12 +13,16 @@ extern "C" {
 #include "main.h"
 #include "config.h"
 #include "utility.h"
-#include "platform/common.h"
 #include "thread_pool.h"
+#include "input.h"
+#include "platform/common.h"
 
 namespace input {
 
 constexpr auto MAX_GAMEPADS = std::min((std::size_t)platf::MAX_GAMEPADS, sizeof(std::int16_t)*8);
+#define DISABLE_LEFT_BUTTON_DELAY ((util::ThreadPool::task_id_t)0x01)
+#define ENABLE_LEFT_BUTTON_DELAY nullptr
+
 enum class button_state_e {
   NONE,
   DOWN,
@@ -39,6 +45,11 @@ template<std::size_t N>
 void free_id(std::bitset<N> &gamepad_mask, int id) {
   gamepad_mask[id] = false;
 }
+
+touch_port_event_t touch_port_event;
+platf::touch_port_t touch_port {
+  0, 0, 0, 0
+};
 
 static util::TaskPool::task_id_t task_id {};
 static std::unordered_map<short, bool> key_press {};
@@ -78,20 +89,32 @@ struct gamepad_t {
 };
 
 struct input_t {
-  input_t() : active_gamepad_state {}, gamepads (MAX_GAMEPADS) { }
+  input_t() : active_gamepad_state {}, gamepads (MAX_GAMEPADS), mouse_left_button_timeout {} { }
 
   std::uint16_t active_gamepad_state;
   std::vector<gamepad_t> gamepads;
+
+  util::ThreadPool::task_id_t mouse_left_button_timeout;
 };
 
 using namespace std::literals;
 
-void print(PNV_MOUSE_MOVE_PACKET packet) {
+void print(PNV_REL_MOUSE_MOVE_PACKET packet) {
   BOOST_LOG(debug)
-    << "--begin mouse move packet--"sv << std::endl
+    << "--begin relative mouse move packet--"sv << std::endl
     << "deltaX ["sv << util::endian::big(packet->deltaX) << ']' << std::endl
     << "deltaY ["sv << util::endian::big(packet->deltaY) << ']' << std::endl
-    << "--end mouse move packet--"sv;
+    << "--end relative mouse move packet--"sv;
+}
+
+void print(PNV_ABS_MOUSE_MOVE_PACKET packet) {
+  BOOST_LOG(debug)
+    << "--begin absolute mouse move packet--"sv << std::endl
+    << "x      ["sv << util::endian::big(packet->x) << ']' << std::endl
+    << "y      ["sv << util::endian::big(packet->y) << ']' << std::endl
+    << "width  ["sv << util::endian::big(packet->width) << ']' << std::endl
+    << "height ["sv << util::endian::big(packet->height) << ']' << std::endl
+    << "--end absolute mouse move packet--"sv;
 }
 
 void print(PNV_MOUSE_BUTTON_PACKET packet) {
@@ -138,8 +161,11 @@ void print(void *input) {
   int input_type = util::endian::big(*(int*)input);
 
   switch(input_type) {
-    case PACKET_TYPE_MOUSE_MOVE:
-      print((PNV_MOUSE_MOVE_PACKET)input);
+    case PACKET_TYPE_REL_MOUSE_MOVE:
+      print((PNV_REL_MOUSE_MOVE_PACKET)input);
+      break;
+    case PACKET_TYPE_ABS_MOUSE_MOVE:
+      print((PNV_ABS_MOUSE_MOVE_PACKET)input);
       break;
     case PACKET_TYPE_MOUSE_BUTTON:
       print((PNV_MOUSE_BUTTON_PACKET)input);
@@ -162,23 +188,107 @@ void print(void *input) {
   }
 }
 
-void passthrough(platf::input_t &input, PNV_MOUSE_MOVE_PACKET packet) {
+void passthrough(std::shared_ptr<input_t> &input, PNV_REL_MOUSE_MOVE_PACKET packet) {
   display_cursor = true;
 
-  platf::move_mouse(input, util::endian::big(packet->deltaX), util::endian::big(packet->deltaY));
+  input->mouse_left_button_timeout = DISABLE_LEFT_BUTTON_DELAY;
+  platf::move_mouse(platf_input, util::endian::big(packet->deltaX), util::endian::big(packet->deltaY));
+}
+
+void passthrough(std::shared_ptr<input_t> &input, PNV_ABS_MOUSE_MOVE_PACKET packet) {
+  display_cursor = true;
+
+  if(input->mouse_left_button_timeout == DISABLE_LEFT_BUTTON_DELAY) {
+    input->mouse_left_button_timeout = ENABLE_LEFT_BUTTON_DELAY;
+  }
+
+  if(touch_port_event->peek()) {
+    touch_port = *touch_port_event->pop();
+  }
+
+  float x = util::endian::big(packet->x);
+  float y = util::endian::big(packet->y);
+
+  // Prevent divide by zero
+  // Don't expect it to happen, but just in case
+  if(!packet->width || !packet->height) {
+    BOOST_LOG(warning) << "Moonlight passed invalid dimensions"sv;
+
+    return;
+  }
+
+  float width  = util::endian::big(packet->width);
+  float height = util::endian::big(packet->height);
+
+  auto scale_x = (float)touch_port.width / width;
+  auto scale_y = (float)touch_port.height / height;
+
+  platf::abs_mouse(platf_input, touch_port, x * scale_x, y * scale_y);
 }
 
 void passthrough(std::shared_ptr<input_t> &input, PNV_MOUSE_BUTTON_PACKET packet) {
   auto constexpr BUTTON_RELEASED = 0x09;
 
+  auto constexpr BUTTON_LEFT  = 0x01;
+  auto constexpr BUTTON_RIGHT = 0x03;
+
   display_cursor = true;
+
+  auto release = packet->action == BUTTON_RELEASED;
 
   auto button = util::endian::big(packet->button);
   if(button > 0 && button < mouse_press.size()) {
-    mouse_press[button] = packet->action != BUTTON_RELEASED;
-  }
+    if(mouse_press[button] != release) {
+      // button state is already what we want
+      return;
+    }
 
-  platf::button_mouse(platf_input, button, packet->action == BUTTON_RELEASED);
+    mouse_press[button] = !release;
+  }
+///////////////////////////////////
+   /*/
+    * When Moonlight sends mouse input through absolute coordinates,
+    * it's possible that BUTTON_RIGHT is pressed down immediately after releasing BUTTON_LEFT.
+    * As a result, Sunshine will left click on hyperlinks in the browser before right clicking
+    *
+    * This can be solved by delaying BUTTON_LEFT, however, any delay on input is undesirable during gaming
+    * As a compromise, Sunshine will only put delays on BUTTON_LEFT when
+    * absolute mouse coordinates have been send.
+    *
+    * Try to make sure BUTTON_RIGHT gets called before BUTTON_LEFT is released.
+    *
+    * input->mouse_left_button_timeout can only be nullptr
+    * when the last mouse coordinates were absolute
+   /*/
+  if(button == BUTTON_LEFT && release && !input->mouse_left_button_timeout) {
+    input->mouse_left_button_timeout = task_pool.pushDelayed([=]() {
+      auto left_released = mouse_press[BUTTON_LEFT];
+      if(left_released) {
+        // Already released left button
+        return;
+      }
+      platf::button_mouse(platf_input, BUTTON_LEFT, release);
+
+      mouse_press[BUTTON_LEFT] = false;
+      input->mouse_left_button_timeout = nullptr;
+    }, 10ms).task_id;
+
+    return;
+  }
+  if(
+    button == BUTTON_RIGHT && !release &&
+    input->mouse_left_button_timeout > DISABLE_LEFT_BUTTON_DELAY
+  ) {
+    platf::button_mouse(platf_input, BUTTON_RIGHT, false);
+    platf::button_mouse(platf_input, BUTTON_RIGHT, true);
+
+    mouse_press[BUTTON_RIGHT] = false;
+
+    return;
+  }
+///////////////////////////////////
+
+  platf::button_mouse(platf_input, button, release);
 }
 
 void repeat_key(short key_code) {
@@ -223,10 +333,10 @@ void passthrough(std::shared_ptr<input_t> &input, PNV_KEYBOARD_PACKET packet) {
   platf::keyboard(platf_input, packet->keyCode & 0x00FF, release);
 }
 
-void passthrough(platf::input_t &input, PNV_SCROLL_PACKET packet) {
+void passthrough(PNV_SCROLL_PACKET packet) {
   display_cursor = true;
 
-  platf::scroll(input, util::endian::big(packet->scrollAmt1));
+  platf::scroll(platf_input, util::endian::big(packet->scrollAmt1));
 }
 
 int updateGamepads(std::vector<gamepad_t> &gamepads, std::int16_t old_state, std::int16_t new_state) {
@@ -374,8 +484,11 @@ void passthrough_helper(std::shared_ptr<input_t> input, std::vector<std::uint8_t
   int input_type = util::endian::big(*(int*)payload);
 
   switch(input_type) {
-    case PACKET_TYPE_MOUSE_MOVE:
-      passthrough(platf_input, (PNV_MOUSE_MOVE_PACKET)payload);
+    case PACKET_TYPE_REL_MOUSE_MOVE:
+      passthrough(input, (PNV_REL_MOUSE_MOVE_PACKET)payload);
+      break;
+    case PACKET_TYPE_ABS_MOUSE_MOVE:
+      passthrough(input, (PNV_ABS_MOUSE_MOVE_PACKET)payload);
       break;
     case PACKET_TYPE_MOUSE_BUTTON:
       passthrough(input, (PNV_MOUSE_BUTTON_PACKET)payload);
@@ -384,7 +497,7 @@ void passthrough_helper(std::shared_ptr<input_t> input, std::vector<std::uint8_t
     {
       char *tmp_input = (char*)payload + 4;
       if(tmp_input[0] == 0x0A) {
-        passthrough(platf_input, (PNV_SCROLL_PACKET)payload);
+        passthrough((PNV_SCROLL_PACKET)payload);
       }
       else {
         passthrough(input, (PNV_KEYBOARD_PACKET)payload);
@@ -402,7 +515,28 @@ void passthrough(std::shared_ptr<input_t> &input, std::vector<std::uint8_t> &&in
   task_pool.push(passthrough_helper, input, util::cmove(input_data));
 }
 
+void reset(std::shared_ptr<input_t> &input) {
+  task_pool.cancel(task_id);
+  task_pool.cancel(input->mouse_left_button_timeout);
+
+  // Ensure input is synchronous, by using the task_pool
+  task_pool.push([]() {
+    for(int x = 0; x < mouse_press.size(); ++x) {
+      if(mouse_press[x]) {
+        platf::button_mouse(platf_input, x, true);
+        mouse_press[x] = false;
+      }
+    }
+
+    for(auto& kp : key_press) {
+      platf::keyboard(platf_input, kp.first & 0x00FF, true);
+      key_press[kp.first] = false;
+    }
+  });
+}
+
 void init() {
+  touch_port_event = std::make_unique<touch_port_event_t::element_type>();
   platf_input = platf::input();
 }
 

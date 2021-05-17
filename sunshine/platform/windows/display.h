@@ -32,6 +32,7 @@ using output_t      = util::safe_ptr<IDXGIOutput, Release<IDXGIOutput>>;
 using output1_t     = util::safe_ptr<IDXGIOutput1, Release<IDXGIOutput1>>;
 using dup_t         = util::safe_ptr<IDXGIOutputDuplication, Release<IDXGIOutputDuplication>>;
 using texture2d_t   = util::safe_ptr<ID3D11Texture2D, Release<ID3D11Texture2D>>;
+using texture1d_t   = util::safe_ptr<ID3D11Texture1D, Release<ID3D11Texture1D>>;
 using resource_t    = util::safe_ptr<IDXGIResource, Release<IDXGIResource>>;
 using multithread_t = util::safe_ptr<ID3D11Multithread, Release<ID3D11Multithread>>;
 
@@ -84,6 +85,19 @@ public:
 
   DXGI_FORMAT format;
   D3D_FEATURE_LEVEL feature_level;
+
+  typedef enum _D3DKMT_SCHEDULINGPRIORITYCLASS
+  {
+    D3DKMT_SCHEDULINGPRIORITYCLASS_IDLE,
+    D3DKMT_SCHEDULINGPRIORITYCLASS_BELOW_NORMAL,
+    D3DKMT_SCHEDULINGPRIORITYCLASS_NORMAL,
+    D3DKMT_SCHEDULINGPRIORITYCLASS_ABOVE_NORMAL,
+    D3DKMT_SCHEDULINGPRIORITYCLASS_HIGH,
+    D3DKMT_SCHEDULINGPRIORITYCLASS_REALTIME
+  }
+  D3DKMT_SCHEDULINGPRIORITYCLASS;
+
+  typedef NTSTATUS WINAPI (*PD3DKMTSetProcessSchedulingPriorityClass)(HANDLE, D3DKMT_SCHEDULINGPRIORITYCLASS);
 };
 
 class display_ram_t : public display_base_t {

@@ -15,7 +15,6 @@
 #include <boost/log/attributes/clock.hpp>
 
 #include "video.h"
-#include "input.h"
 #include "nvhttp.h"
 #include "rtsp.h"
 #include "config.h"
@@ -138,7 +137,10 @@ int main(int argc, char *argv[]) {
   proc::proc = std::move(*proc_opt);
 
   auto deinit_guard = platf::init();
-  input::init();
+  if(!deinit_guard) {
+    return 4;
+  }
+
   reed_solomon_init();
   if(video::init()) {
     return 2;
@@ -150,6 +152,8 @@ int main(int argc, char *argv[]) {
   stream::rtpThread(shutdown_event);
 
   httpThread.join();
+  task_pool.stop();
+  task_pool.join();
 
   return 0;
 }

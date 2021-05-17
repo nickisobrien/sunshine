@@ -360,7 +360,11 @@ void pair(std::shared_ptr<safe::queue_t<crypto::x509_t>> &add_cert, std::shared_
 
       ptr->second.async_insert_pin.salt = std::move(args.at("salt"s));
 
-      if(config::sunshine.flags[config::flag::PIN_STDIN]) {
+      if(config::sunshine.flags[config::flag::CONST_PIN]) {
+        std::string pin("6174");
+        getservercert(ptr->second, tree, pin);
+      }
+      else if(config::sunshine.flags[config::flag::PIN_STDIN]) {
         std::string pin;
 
         std::cout << "Please insert pin: "sv;
@@ -842,8 +846,22 @@ void start(std::shared_ptr<safe::signal_t> shutdown_event) {
     return;
   }
 
-  std::thread ssl { &https_server_t::accept_and_run, &https_server };
-  std::thread tcp { &http_server_t::accept_and_run, &http_server };
+  auto accept_and_run = [&](auto *http_server) {
+    try {
+      http_server->accept_and_run();
+    } catch(boost::system::system_error &err) {
+      // It's possible the exception gets thrown after calling http_server->stop() from a different thread
+      if(shutdown_event->peek()) {
+        return;
+      }
+
+      BOOST_LOG(fatal) << "Couldn't start http server to ports ["sv << PORT_HTTPS << ", "sv << PORT_HTTP << "]: "sv << err.what();
+      shutdown_event->raise(true);
+      return;
+    }
+  };
+  std::thread ssl { accept_and_run, &https_server };
+  std::thread tcp { accept_and_run, &http_server };
 
   // Wait for any event
   shutdown_event->view();
